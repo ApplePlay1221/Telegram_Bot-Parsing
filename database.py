@@ -10,15 +10,15 @@ class Database:
     def get_connection(self):
         """Получение соединения с БД"""
         conn = sqlite3.connect(self.db_name)
-        conn.row_factory = sqlite3.Row  # Для доступа по именам колонок
+        conn.row_factory = sqlite3.Row
         return conn
     
     def init_db(self):
-        """Инициализация базы данных"""
+        """Инициализация базы данных с новым полем summary"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Создание таблицы для постов
+            # Создание таблицы с полем summary
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS posts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,21 +26,24 @@ class Database:
                     url TEXT UNIQUE NOT NULL,
                     author TEXT,
                     published_date TEXT,
-                    preview_text TEXT,
+                    summary TEXT,  -- Новое поле для краткого содержания
                     tags TEXT,
+                    views TEXT,
+                    reading_time TEXT,
                     posted_to_telegram INTEGER DEFAULT 0,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # Создание индексов для быстрого поиска
+            # Создание индексов
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON posts(url)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_posted ON posts(posted_to_telegram)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_date ON posts(published_date)')
             
             conn.commit()
     
     def add_post(self, post_data):
-        """Добавление нового поста"""
+        """Добавление нового поста с кратким содержанием"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -56,21 +59,20 @@ class Database:
             if isinstance(published_date, datetime):
                 published_date = published_date.isoformat()
             
-            tags = post_data.get('tags', '')
-            if isinstance(tags, list):
-                tags = ', '.join(tags)
-            
-            # Вставка нового поста
+            # Вставка нового поста со всеми полями
             cursor.execute('''
-                INSERT INTO posts (title, url, author, published_date, preview_text, tags)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO posts 
+                (title, url, author, published_date, summary, tags, views, reading_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 post_data['title'],
                 post_data['url'],
                 post_data.get('author', 'Неизвестный автор'),
                 published_date,
-                post_data.get('preview_text', ''),
-                tags
+                post_data.get('summary', ''),  # Краткое содержание
+                post_data.get('tags', ''),
+                post_data.get('views', ''),
+                post_data.get('reading_time', '')
             ))
             
             conn.commit()
@@ -132,14 +134,14 @@ class Database:
             if include_posted:
                 cursor.execute('''
                     SELECT * FROM posts 
-                    ORDER BY created_at DESC 
+                    ORDER BY published_date DESC 
                     LIMIT ?
                 ''', (limit,))
             else:
                 cursor.execute('''
                     SELECT * FROM posts 
                     WHERE posted_to_telegram = 0
-                    ORDER BY created_at DESC 
+                    ORDER BY published_date DESC 
                     LIMIT ?
                 ''', (limit,))
             
@@ -158,29 +160,19 @@ class Database:
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
     
-    def get_posts_by_author(self, author, limit=10):
-        """Получение постов конкретного автора"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT * FROM posts 
-                WHERE author LIKE ? 
-                ORDER BY published_date DESC 
-                LIMIT ?
-            ''', (f'%{author}%', limit))
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
-    
     def search_posts(self, query):
-        """Поиск постов по заголовку или тексту"""
+        """Поиск постов по заголовку, автору или содержанию"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT * FROM posts 
-                WHERE title LIKE ? OR preview_text LIKE ? 
+                WHERE title LIKE ? 
+                   OR author LIKE ? 
+                   OR summary LIKE ? 
+                   OR tags LIKE ?
                 ORDER BY published_date DESC 
                 LIMIT 20
-            ''', (f'%{query}%', f'%{query}%'))
+            ''', (f'%{query}%', f'%{query}%', f'%{query}%', f'%{query}%'))
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
     
@@ -200,13 +192,14 @@ class Database:
             cursor.execute('''
                 SELECT author, COUNT(*) as count 
                 FROM posts 
+                WHERE author IS NOT NULL AND author != ''
                 GROUP BY author 
                 ORDER BY count DESC 
                 LIMIT 5
             ''')
             top_authors = [dict(row) for row in cursor.fetchall()]
             
-            # Статистика по дням (последние 7 дней)
+            # Статистика по дням
             cursor.execute('''
                 SELECT DATE(published_date) as date, COUNT(*) as count
                 FROM posts 
@@ -223,44 +216,3 @@ class Database:
                 'top_authors': top_authors,
                 'daily_stats': daily_stats
             }
-    
-    def delete_old_posts(self, days=30):
-        """Удаление старых постов (для очистки БД)"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                DELETE FROM posts 
-                WHERE DATE(created_at) < DATE('now', ?)
-            ''', (f'-{days} days',))
-            deleted = cursor.rowcount
-            conn.commit()
-            return deleted
-    
-    def get_post_by_id(self, post_id):
-        """Получение поста по ID"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM posts WHERE id = ?', (post_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-    
-    def update_post(self, post_id, **kwargs):
-        """Обновление данных поста"""
-        allowed_fields = ['title', 'author', 'preview_text', 'tags']
-        updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
-        
-        if not updates:
-            return False
-        
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            set_clause = ', '.join([f"{key} = ?" for key in updates.keys()])
-            values = list(updates.values()) + [post_id]
-            
-            cursor.execute(f'''
-                UPDATE posts 
-                SET {set_clause} 
-                WHERE id = ?
-            ''', values)
-            conn.commit()
-            return cursor.rowcount > 0
